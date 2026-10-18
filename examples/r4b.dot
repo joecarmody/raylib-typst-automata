@@ -1,0 +1,8 @@
+digraph {
+	0 [shape=doublecircle]; 1 [shape=doublecircle]; 
+	0 -> 1 [label="a | ε"];
+	1 -> 0 [label="a | aa, b | a≀b"];
+	0 -> 0 [label="b | b"];
+	2 [shape="circle", style="invis"];
+	1 -> 2 [label="a"];
+}

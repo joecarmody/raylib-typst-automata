@@ -9,7 +9,10 @@
 // positions. Conventions:
 //   shape=doublecircle                    accepting state
 //   edge from a shape=point, style=invis  marks its target as initial
-//     or unlabelled shape=none node
+//     or unlabelled shape=none node         (when that is all the node does)
+//   any other invisible node              a loose arrow end: shown as a
+//                                         dashed handle, exported as a
+//                                         coordinate rather than a node
 //   several edges between the same pair   merged, labels joined with ", "
 //
 // Controls:
@@ -35,6 +38,7 @@
 #include "raymath.h"
 
 #define NODE_R      28.0f
+#define GHOST_R     9.0f     // handle drawn at a loose arrow end
 #define ACCEPT_GAP  4.0f     // inner ring of accepting states
 #define GRID        60.0f
 #define BEND_DEG    25.0f
@@ -73,6 +77,7 @@ typedef struct {
     bool initial;
     Vector2 init_dir;  // direction the initial arrow comes from
     int fill;          // index into palette[], or -1 for none
+    bool ghost;        // invisible in DOT: a loose arrow end, not a real state
 } State;
 
 // Which side of an edge its label sits on, relative to the direction of
@@ -102,6 +107,7 @@ static const Color INK    = {  30,  30,  35, 255 };
 static const Color GRIDC  = { 225, 222, 215, 255 };
 static const Color HOVER  = { 230, 238, 250, 255 };
 static const Color ACTIVE = { 205, 222, 248, 255 };
+static const Color GHOSTC = { 150, 150, 160, 255 };
 
 // State fills: Typst's named colours lightened by FILL_LIGHTEN, with the RGB
 // values Typst computes for them.
@@ -167,6 +173,7 @@ static char *ShellQuote(const char *s) {
 typedef struct {
     char *name, *label;
     Vector2 pos;   // inches, y up
+    bool invisible;
     bool marker;   // invisible start marker, not a state
     bool accepting;
     int start;     // marker node pointing at this one, or -1
@@ -227,12 +234,12 @@ static bool LoadDot(const char *path, int *w, int *h) {
         } else if (n >= 11 && strcmp(tok[0], "node") == 0 && n_nodes < MAX_STATES * 2) {
             // node name x y width height label style shape color fillcolor
             const char *label = tok[6], *style = tok[7], *shape = tok[8];
-            bool marker = strcmp(shape, "point") == 0 || strstr(style, "invis") ||
-                          ((strcmp(shape, "none") == 0 || strcmp(shape, "plaintext") == 0) && !*label);
+            bool invisible = strcmp(shape, "point") == 0 || strstr(style, "invis") ||
+                             ((strcmp(shape, "none") == 0 || strcmp(shape, "plaintext") == 0) && !*label);
             nodes[n_nodes++] = (DotNode){
                 .name = strdup(tok[1]), .label = strdup(label),
                 .pos = { atof(tok[2]), atof(tok[3]) },
-                .marker = marker, .accepting = strcmp(shape, "doublecircle") == 0,
+                .invisible = invisible, .marker = invisible, .accepting = strcmp(shape, "doublecircle") == 0,
                 .start = -1, .state = -1,
             };
         } else if (n >= 4 && strcmp(tok[0], "edge") == 0 && n_dedges < MAX_EDGES * 2) {
@@ -250,8 +257,15 @@ static bool LoadDot(const char *path, int *w, int *h) {
         return false;
     }
 
+    // An invisible node whose edges are all unlabelled and outgoing marks
+    // initial states. Any other invisible node is a loose arrow end (ghost).
+    for (int i = 0; i < n_dedges; i++) {
+        DotNode *tail = &nodes[dedges[i].tail], *head = &nodes[dedges[i].head];
+        head->marker = false;
+        if (*dedges[i].label || head->invisible) tail->marker = false;
+    }
     for (int i = 0; i < n_dedges; i++)
-        if (nodes[dedges[i].tail].marker && !nodes[dedges[i].head].marker)
+        if (nodes[dedges[i].tail].marker)
             nodes[dedges[i].head].start = dedges[i].tail;
 
     // Graphviz inches (y up) -> pixels (y down), scaled down if too big for MAX_W x MAX_H.
@@ -269,6 +283,7 @@ static bool LoadDot(const char *path, int *w, int *h) {
         State *s = &states[n_states++];
         *s = (State){
             .name = dn->name, .label = dn->label, .accepting = dn->accepting, .fill = -1,
+            .ghost = dn->invisible,
             .pos = { offset.x + dn->pos.x * scale, offset.y + (gh - dn->pos.y) * scale },
         };
         if (dn->start >= 0) {
@@ -372,6 +387,11 @@ static Vector2 LoopDirection(int s) {
     return (Vector2){ cosf(best_mid), sinf(best_mid) };
 }
 
+// How far an edge stops short of a state's centre.
+static float EndRadius(int s) {
+    return states[s].ghost ? 0 : NODE_R;
+}
+
 // The edge as drawn, from the source's boundary to the arrow tip: a straight
 // line, a circular arc (as in fletcher's `bend:`) when there is an edge going
 // the other way, or a self-loop. Empty if the states overlap.
@@ -379,7 +399,10 @@ static Path EdgePath(int e) {
     Path path = { .n = 0 };
     Vector2 a = states[edges[e].from].pos, b = states[edges[e].to].pos;
 
+    float ra = EndRadius(edges[e].from), rb = EndRadius(edges[e].to);
+
     if (edges[e].from == edges[e].to) {
+        if (states[edges[e].from].ghost) return path;
         float lr = NODE_R * 0.55f;           // loop circle radius
         float D = NODE_R + lr * 0.45f;       // distance between node and loop centres
         Vector2 dir = LoopDirection(edges[e].from);
@@ -397,12 +420,12 @@ static Path EdgePath(int e) {
     }
 
     float d = Vector2Distance(a, b);
-    if (d < 2 * NODE_R + 1) return path;
+    if (d < ra + rb + 1) return path;
     Vector2 u = Vector2Scale(Vector2Subtract(b, a), 1.0f / d);
 
     if (!HasReverse(e)) {
-        path.pts[0] = Vector2Add(a, Vector2Scale(u, NODE_R));
-        path.pts[1] = Vector2Subtract(b, Vector2Scale(u, NODE_R));
+        path.pts[0] = Vector2Add(a, Vector2Scale(u, ra));
+        path.pts[1] = Vector2Subtract(b, Vector2Scale(u, rb));
         path.n = 2;
         return path;
     }
@@ -423,7 +446,7 @@ static Path EdgePath(int e) {
     for (int i = 0; i <= ARC_SEGS; i++) {
         float t = a0 + sweep * i / ARC_SEGS;
         Vector2 p = { c.x + r * cosf(t), c.y + r * sinf(t) };
-        if (Vector2Distance(p, a) >= NODE_R && Vector2Distance(p, b) >= NODE_R) path.pts[path.n++] = p;
+        if (Vector2Distance(p, a) >= ra && Vector2Distance(p, b) >= rb) path.pts[path.n++] = p;
     }
     if (path.n < 2) path.n = 0;
     return path;
@@ -578,6 +601,14 @@ static void DrawState(int s, Color fill) {
     DrawLabel(states[s].label, p);
 }
 
+// Dashed handle at a loose arrow end. Editor only: nothing is exported for it.
+static void DrawGhost(int s, Color fill) {
+    Vector2 p = states[s].pos;
+    if (fill.a > 0) DrawCircleV(p, GHOST_R, Fade(fill, 0.8f));
+    for (int a = 0; a < 360; a += 30)
+        DrawRing(p, GHOST_R - STROKE / 2, GHOST_R + STROKE / 2, a, a + 15, 4, GHOSTC);
+}
+
 static void DrawInitialArrow(int s) {
     Vector2 p = states[s].pos, dir = states[s].init_dir;
     Vector2 tip = Vector2Add(p, Vector2Scale(dir, NODE_R));
@@ -607,7 +638,7 @@ static int SwatchAt(Vector2 m) {
 
 static int StateAt(Vector2 m) {
     for (int s = n_states - 1; s >= 0; s--)
-        if (Vector2Distance(m, states[s].pos) <= NODE_R) return s;
+        if (Vector2Distance(m, states[s].pos) <= (states[s].ghost ? GHOST_R + 3 : NODE_R)) return s;
     return -1;
 }
 
@@ -663,14 +694,17 @@ static void WriteText(FILE *f, const char *s) {
 // source; anything else is taken literally: punctuation is escaped (so `->`
 // or `_` stay as typed), and letters are spaced apart from neighbouring
 // letters and digits so runs like `ab` or `q0` aren't read as variable names.
+// Non-ASCII characters (say `ε`) are spaced like letters.
 static void WriteMath(FILE *f, const char *s) {
     size_t len = strlen(s);
     if (len >= 2 && s[0] == '$' && s[len - 1] == '$') { fputs(s, f); return; }
     if (len == 0) { fputs("[]", f); return; }
     fputc('$', f);
-    unsigned char prev = 0;
+    unsigned char prev = 0;  // previous character's first byte
     for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
-        if (isalnum(*c) && isalnum(prev) && (isalpha(*c) || isalpha(prev))) fputc(' ', f);
+        if ((*c & 0xC0) == 0x80) { fputc(*c, f); continue; }  // rest of a UTF-8 character
+        bool word = isalnum(*c) || *c >= 0x80, prev_word = isalnum(prev) || prev >= 0x80;
+        if (word && prev_word && !(isdigit(*c) && isdigit(prev))) fputc(' ', f);
         if (ispunct(*c)) fputc('\\', f);
         fputc(*c, f);
         prev = *c;
@@ -692,16 +726,28 @@ static void WriteName(FILE *f, const char *s) {
     }
 }
 
+// An edge end: the state's name, or the bare coordinate of a loose end.
+static void WriteEndpoint(FILE *f, int s, Vector2 origin) {
+    if (states[s].ghost) {
+        Vector2 g = Vector2Scale(Vector2Subtract(states[s].pos, origin), 1 / GRID);
+        fprintf(f, "at(%s, %s)", Num(g.x), Num(g.y));
+    } else {
+        WriteName(f, states[s].name);
+    }
+}
+
 static bool ExportFletcher(const char *out, const char *source) {
     FILE *f = fopen(out, "w");
     if (!f) { perror(out); return false; }
 
     // Grid coordinates relative to the top-left-most state, y down.
-    Vector2 origin = states[0].pos;
-    for (int s = 1; s < n_states; s++) {
+    Vector2 origin = { INFINITY, INFINITY };
+    for (int s = 0; s < n_states; s++) {
+        if (states[s].ghost) continue;
         origin.x = fminf(origin.x, states[s].pos.x);
         origin.y = fminf(origin.y, states[s].pos.y);
     }
+    if (isinf(origin.x)) origin = states[0].pos;
 
     fprintf(f, "// Generated by dfa from %s; exporting again overwrites this file.\n", GetFileName(source));
     fprintf(f, "#import \"@preview/fletcher:%s\" as fletcher: diagram, node, edge\n\n", FLETCHER_VERSION);
@@ -711,6 +757,7 @@ static bool ExportFletcher(const char *out, const char *source) {
     fprintf(f, "    let state = node.with(shape: circle, radius: %s * u)\n\n", Num(NODE_R / GRID));
 
     for (int s = 0; s < n_states; s++) {
+        if (states[s].ghost) continue;
         Vector2 g = Vector2Scale(Vector2Subtract(states[s].pos, origin), 1 / GRID);
         fprintf(f, "    state(at(%s, %s), ", Num(g.x), Num(g.y));
         WriteText(f, states[s].label);
@@ -735,9 +782,9 @@ static bool ExportFletcher(const char *out, const char *source) {
 
     for (int e = 0; e < n_edges; e++) {
         fputs("    edge(", f);
-        WriteName(f, states[edges[e].from].name);
+        WriteEndpoint(f, edges[e].from, origin);
         fputs(", ", f);
-        WriteName(f, states[edges[e].to].name);
+        WriteEndpoint(f, edges[e].to, origin);
         fputs(", \"-|>\"", f);
         if (*edges[e].label) {
             static const char *side_names[] = { "auto", "left", "right", "center" };
@@ -819,9 +866,10 @@ int main(int argc, char **argv) {
 
         if (colour_mode) {
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hover_swatch >= 0) brush = hover_swatch;
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hover >= 0)
+            bool paintable = hover >= 0 && !states[hover].ghost;
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && paintable)
                 states[hover].fill = states[hover].fill == brush ? -1 : brush;
-            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && hover >= 0) states[hover].fill = -1;
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && paintable) states[hover].fill = -1;
         } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             if (hover >= 0) {
                 dragging = hover;
@@ -865,6 +913,11 @@ int main(int argc, char **argv) {
         for (int s = 0; s < n_states; s++)
             if (states[s].initial) DrawInitialArrow(s);
         for (int s = 0; s < n_states; s++) {
+            if (states[s].ghost) {
+                bool live = !colour_mode && (s == dragging || s == hover);
+                DrawGhost(s, live ? (s == dragging ? ACTIVE : HOVER) : BLANK);
+                continue;
+            }
             Color fill = states[s].fill >= 0 ? palette[states[s].fill].rgb : BG;
             if (colour_mode && s == hover) {
                 // Preview what a click would do.
