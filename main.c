@@ -17,6 +17,12 @@
 //   right-click   reset an edge label to fletcher's default placement
 //   G             toggle grid snapping
 //   E             export fletcher code
+//   C, Esc        enter / leave colour mode
+//
+// Colour mode:
+//   1-7 or click a swatch   pick a fill colour
+//   left-click a state      fill it (click again to clear)
+//   right-click a state     clear its fill
 
 #define _POSIX_C_SOURCE 200809L  // popen, getline, strdup
 
@@ -66,6 +72,7 @@ typedef struct {
     bool accepting;
     bool initial;
     Vector2 init_dir;  // direction the initial arrow comes from
+    int fill;          // index into palette[], or -1 for none
 } State;
 
 // Which side of an edge its label sits on, relative to the direction of
@@ -95,6 +102,26 @@ static const Color INK    = {  30,  30,  35, 255 };
 static const Color GRIDC  = { 225, 222, 215, 255 };
 static const Color HOVER  = { 230, 238, 250, 255 };
 static const Color ACTIVE = { 205, 222, 248, 255 };
+
+// State fills: Typst's named colours lightened by FILL_LIGHTEN, with the RGB
+// values Typst computes for them.
+#define FILL_LIGHTEN "65%"
+typedef struct {
+    const char *typst;
+    Color rgb;
+} Paint;
+
+static const Paint palette[] = {
+    { "red",    { 0xff, 0xbc, 0xb9, 255 } },
+    { "orange", { 0xff, 0xd4, 0xaf, 255 } },
+    { "yellow", { 0xff, 0xf3, 0xa6, 255 } },
+    { "green",  { 0xb6, 0xed, 0xbc, 255 } },
+    { "blue",   { 0xa6, 0xce, 0xf2, 255 } },
+    { "purple", { 0xe4, 0xaa, 0xec, 255 } },
+    { "gray",   { 0xe1, 0xe1, 0xe1, 255 } },
+};
+#define N_PAINTS ((int)(sizeof palette / sizeof palette[0]))
+#define SWATCH   22
 
 // ---------------------------------------------------------------------------
 // DOT import via `dot -Tplain`
@@ -241,7 +268,7 @@ static bool LoadDot(const char *path, int *w, int *h) {
         dn->state = n_states;
         State *s = &states[n_states++];
         *s = (State){
-            .name = dn->name, .label = dn->label, .accepting = dn->accepting,
+            .name = dn->name, .label = dn->label, .accepting = dn->accepting, .fill = -1,
             .pos = { offset.x + dn->pos.x * scale, offset.y + (gh - dn->pos.y) * scale },
         };
         if (dn->start >= 0) {
@@ -558,6 +585,26 @@ static void DrawInitialArrow(int s) {
     DrawPolyArrow(pts, 2);
 }
 
+static Rectangle SwatchRect(int i) {
+    return (Rectangle){ GetScreenWidth() - (N_PAINTS - i) * (SWATCH + 6) - 6,
+                        GetScreenHeight() - SWATCH - 8, SWATCH, SWATCH };
+}
+
+static void DrawPalette(int brush) {
+    for (int i = 0; i < N_PAINTS; i++) {
+        Rectangle r = SwatchRect(i);
+        DrawRectangleRec(r, palette[i].rgb);
+        DrawRectangleLinesEx(r, i == brush ? 3 : 1, i == brush ? INK : GRAY);
+        DrawText(TextFormat("%d", i + 1), r.x + 7, r.y + 5, 14, INK);
+    }
+}
+
+static int SwatchAt(Vector2 m) {
+    for (int i = 0; i < N_PAINTS; i++)
+        if (CheckCollisionPointRec(m, SwatchRect(i))) return i;
+    return -1;
+}
+
 static int StateAt(Vector2 m) {
     for (int s = n_states - 1; s >= 0; s--)
         if (Vector2Distance(m, states[s].pos) <= NODE_R) return s;
@@ -650,7 +697,9 @@ static bool ExportFletcher(const char *out, const char *source) {
         WriteContent(f, states[s].label);
         fputs(", name: ", f);
         WriteName(f, states[s].name);
-        if (states[s].accepting) fputs(", extrude: (-2.5, 0)", f);
+        // Outer stroke first: fletcher fills inside the first extrude offset.
+        if (states[s].accepting) fputs(", extrude: (0, -2.5)", f);
+        if (states[s].fill >= 0) fprintf(f, ", fill: %s.lighten(%s)", palette[states[s].fill].typst, FILL_LIGHTEN);
         fputs(")\n", f);
     }
     fputc('\n', f);
@@ -731,15 +780,30 @@ int main(int argc, char **argv) {
     int dragging = -1, dragging_label = -1;
     Vector2 grab = { 0 };
     bool snap = false;
+    bool colour_mode = false;
+    int brush = 0;
     char status[512] = "";
     double status_until = 0;
 
     while (!WindowShouldClose()) {
         Vector2 m = GetMousePosition();
         int hover = StateAt(m);
-        int hover_label = hover < 0 ? LabelAt(m) : -1;
+        int hover_label = hover < 0 && !colour_mode ? LabelAt(m) : -1;
+        int hover_swatch = colour_mode ? SwatchAt(m) : -1;
 
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        if (IsKeyPressed(KEY_C)) colour_mode = !colour_mode;
+        if (colour_mode && IsKeyPressed(KEY_ESCAPE)) colour_mode = false;
+        for (int i = 0; i < N_PAINTS; i++)
+            if (IsKeyPressed(KEY_ONE + i)) brush = i, colour_mode = true;
+        // Esc leaves colour mode rather than quitting.
+        SetExitKey(colour_mode ? KEY_NULL : KEY_ESCAPE);
+
+        if (colour_mode) {
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hover_swatch >= 0) brush = hover_swatch;
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hover >= 0)
+                states[hover].fill = states[hover].fill == brush ? -1 : brush;
+            if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && hover >= 0) states[hover].fill = -1;
+        } else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             if (hover >= 0) {
                 dragging = hover;
                 grab = Vector2Subtract(states[hover].pos, m);
@@ -768,7 +832,7 @@ int main(int argc, char **argv) {
             if (ok) printf("dfa: %s\n", status);
         }
 
-        bool pointing = dragging >= 0 || dragging_label >= 0 || hover >= 0 || hover_label >= 0;
+        bool pointing = dragging >= 0 || dragging_label >= 0 || hover >= 0 || hover_label >= 0 || hover_swatch >= 0;
         SetMouseCursor(pointing ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
 
         BeginDrawing();
@@ -781,11 +845,23 @@ int main(int argc, char **argv) {
             DrawEdge(e, e == dragging_label ? ACTIVE : e == hover_label ? HOVER : BLANK);
         for (int s = 0; s < n_states; s++)
             if (states[s].initial) DrawInitialArrow(s);
-        for (int s = 0; s < n_states; s++)
-            DrawState(s, s == dragging ? ACTIVE : s == hover ? HOVER : BG);
+        for (int s = 0; s < n_states; s++) {
+            Color fill = states[s].fill >= 0 ? palette[states[s].fill].rgb : BG;
+            if (colour_mode && s == hover) {
+                // Preview what a click would do.
+                fill = states[s].fill == brush ? BG : palette[brush].rgb;
+            } else if (s == dragging || s == hover) {
+                Color tint = s == dragging ? ACTIVE : HOVER;
+                fill = states[s].fill >= 0 ? ColorBrightness(fill, s == dragging ? -0.15f : -0.08f) : tint;
+            }
+            DrawState(s, fill);
+        }
 
-        const char *help = TextFormat("drag states and labels   [G] snap: %s   [E] export fletcher", snap ? "on" : "off");
+        const char *help = colour_mode
+            ? "colour mode: click a state to fill it   [1-7] pick colour   [C/Esc] done"
+            : TextFormat("drag states and labels   [G] snap: %s   [C] colour   [E] export fletcher", snap ? "on" : "off");
         DrawText(GetTime() < status_until ? status : help, 12, GetScreenHeight() - 26, 16, GRAY);
+        if (colour_mode) DrawPalette(brush);
         EndDrawing();
 
         if (shot) { TakeScreenshot(shot); break; }
