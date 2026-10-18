@@ -14,6 +14,8 @@
 //                                         dashed handle, exported as a
 //                                         coordinate rather than a node
 //   several edges between the same pair   merged, labels joined with ", "
+//     with the same style
+//   style=dashed on an edge               dashed arrow
 //
 // Controls:
 //   left-drag     move a state or an edge label
@@ -90,6 +92,7 @@ typedef struct {
     float label_pos;       // fraction along the drawn edge
     LabelSide label_side;
     float label_sep;       // em; negative for fletcher's default
+    bool dashed;
 } Edge;
 
 typedef struct {
@@ -183,6 +186,7 @@ typedef struct {
 typedef struct {
     int tail, head;  // indices into the DotNode array
     char *label;
+    bool dashed;
 } DotEdge;
 
 static int FindNode(DotNode *nodes, int n, const char *name) {
@@ -191,9 +195,9 @@ static int FindNode(DotNode *nodes, int n, const char *name) {
     return -1;
 }
 
-static void AddEdge(int from, int to, const char *label) {
+static void AddEdge(int from, int to, const char *label, bool dashed) {
     for (int i = 0; i < n_edges; i++) {
-        if (edges[i].from != from || edges[i].to != to) continue;
+        if (edges[i].from != from || edges[i].to != to || edges[i].dashed != dashed) continue;
         if (*label) {
             char *joined = malloc(strlen(edges[i].label) + strlen(label) + 3);
             sprintf(joined, *edges[i].label ? "%s, %s" : "%s%s", edges[i].label, label);
@@ -203,7 +207,7 @@ static void AddEdge(int from, int to, const char *label) {
         return;
     }
     if (n_edges == MAX_EDGES) return;
-    edges[n_edges++] = (Edge){ from, to, strdup(label), 0.5f, SIDE_AUTO, -1 };
+    edges[n_edges++] = (Edge){ from, to, strdup(label), 0.5f, SIDE_AUTO, -1, dashed };
 }
 
 // Load the automaton and lay it out to fit a window of size *w x *h.
@@ -247,7 +251,8 @@ static bool LoadDot(const char *path, int *w, int *h) {
             int a = FindNode(nodes, n_nodes, tok[1]), b = FindNode(nodes, n_nodes, tok[2]);
             int after = 4 + 2 * atoi(tok[3]);
             if (a >= 0 && b >= 0)
-                dedges[n_dedges++] = (DotEdge){ a, b, strdup(n - after == 5 ? tok[after] : "") };
+                dedges[n_dedges++] = (DotEdge){ a, b, strdup(n - after == 5 ? tok[after] : ""),
+                                                 n >= after + 2 && strstr(tok[n - 2], "dashed") };
         }
         free(tok);
     }
@@ -299,7 +304,7 @@ static bool LoadDot(const char *path, int *w, int *h) {
 
     for (int i = 0; i < n_dedges; i++) {
         int a = nodes[dedges[i].tail].state, b = nodes[dedges[i].head].state;
-        if (a >= 0 && b >= 0) AddEdge(a, b, dedges[i].label);
+        if (a >= 0 && b >= 0) AddEdge(a, b, dedges[i].label, dedges[i].dashed);
         free(dedges[i].label);
     }
     return true;
@@ -338,13 +343,38 @@ static void DrawLabel(const char *text, Vector2 center) {
     DrawTextEx(GetFontDefault(), text, at, FONT_SIZE, 2, INK);
 }
 
-// Draw a polyline, stopping short so the arrowhead covers the end.
-static void DrawPolyArrow(Vector2 *pts, int n) {
+// Draw a polyline, stopping short so the arrowhead covers the end. Dashed
+// lines follow Typst's "dashed" pattern, 3pt on and 3pt off, continuing
+// across segments.
+static void DrawPolyArrow(const Vector2 *pts, int n, bool dashed) {
     Vector2 tip = pts[n - 1];
     Vector2 dir = Vector2Subtract(tip, pts[n - 2]);
     Vector2 stop = Vector2Subtract(tip, Vector2Scale(Vector2Normalize(dir), ARROW_LEN * 0.8f));
-    for (int i = 0; i < n - 2; i++) DrawLineEx(pts[i], pts[i + 1], STROKE, INK);
-    DrawLineEx(pts[n - 2], stop, STROKE, INK);
+    // Pattern state carried from segment to segment. Tracking what is left of
+    // the current dash or gap (rather than recomputing it from a running
+    // total) guarantees progress: each step either ends the segment or ends a
+    // run, and every other step advances by a whole dash length.
+    float dash = 3 * PT_PX, run_left = dash;
+    bool on = true;
+    for (int i = 0; i < n - 1; i++) {
+        Vector2 a = pts[i], b = (i == n - 2) ? stop : pts[i + 1];
+        if (!dashed) {
+            DrawLineEx(a, b, STROKE, INK);
+            continue;
+        }
+        float len = Vector2Distance(a, b), t = 0;
+        while (t < len) {
+            if (t + run_left >= len) {
+                if (on) DrawLineEx(Vector2Lerp(a, b, t / len), b, STROKE, INK);
+                run_left -= len - t;
+                break;
+            }
+            if (on) DrawLineEx(Vector2Lerp(a, b, t / len), Vector2Lerp(a, b, (t + run_left) / len), STROKE, INK);
+            t += run_left;
+            run_left = dash;
+            on = !on;
+        }
+    }
     DrawArrowHead(tip, dir, INK);
 }
 
@@ -575,7 +605,7 @@ static void DragLabel(int e, Vector2 c) {
 static void DrawEdge(int e, Color fill) {
     Path p = EdgePath(e);
     if (p.n < 2) return;
-    DrawPolyArrow(p.pts, p.n);
+    DrawPolyArrow(p.pts, p.n, edges[e].dashed);
     if (!*edges[e].label) return;
     Rectangle r = LabelRect(e, &p);
     if (fill.a > 0) DrawRectangleRounded(r, 0.3f, 4, fill);
@@ -613,7 +643,7 @@ static void DrawInitialArrow(int s) {
     Vector2 p = states[s].pos, dir = states[s].init_dir;
     Vector2 tip = Vector2Add(p, Vector2Scale(dir, NODE_R));
     Vector2 pts[2] = { Vector2Add(tip, Vector2Scale(dir, INIT_LEN)), tip };
-    DrawPolyArrow(pts, 2);
+    DrawPolyArrow(pts, 2, false);
 }
 
 static Rectangle SwatchRect(int i) {
@@ -736,7 +766,7 @@ static void WriteEndpoint(FILE *f, int s, Vector2 origin) {
     }
 }
 
-static bool ExportFletcher(const char *out, const char *source) {
+static bool ExportFletcher(const char *out) {
     FILE *f = fopen(out, "w");
     if (!f) { perror(out); return false; }
 
@@ -749,11 +779,10 @@ static bool ExportFletcher(const char *out, const char *source) {
     }
     if (isinf(origin.x)) origin = states[0].pos;
 
-    fprintf(f, "// Generated by dfa from %s; exporting again overwrites this file.\n", GetFileName(source));
     fprintf(f, "#import \"@preview/fletcher:%s\" as fletcher: diagram, node, edge\n\n", FLETCHER_VERSION);
     fprintf(f, "#diagram(\n  node-stroke: 0.8pt,\n  {\n");
-    fprintf(f, "    let u = 1cm  // one editor grid square\n");
-    fprintf(f, "    let at(x, y) = (x * u, -y * u)  // y points down, as in the editor\n");
+    fprintf(f, "    let u = 1cm\n");
+    fprintf(f, "    let at(x, y) = (x * u, -y * u)\n");
     fprintf(f, "    let state = node.with(shape: circle, radius: %s * u)\n\n", Num(NODE_R / GRID));
 
     for (int s = 0; s < n_states; s++) {
@@ -785,7 +814,7 @@ static bool ExportFletcher(const char *out, const char *source) {
         WriteEndpoint(f, edges[e].from, origin);
         fputs(", ", f);
         WriteEndpoint(f, edges[e].to, origin);
-        fputs(", \"-|>\"", f);
+        fputs(edges[e].dashed ? ", \"--|>\"" : ", \"-|>\"", f);
         if (*edges[e].label) {
             static const char *side_names[] = { "auto", "left", "right", "center" };
             fputs(", ", f);
@@ -837,7 +866,7 @@ int main(int argc, char **argv) {
     if (!out) out = DefaultOutput(path);
     int w, h;
     if (!LoadDot(path, &w, &h)) return 1;
-    if (export_only) return ExportFletcher(out, path) ? 0 : 1;
+    if (export_only) return ExportFletcher(out) ? 0 : 1;
 
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(w, h, TextFormat("dfa - %s", GetFileName(path)));
@@ -893,7 +922,7 @@ int main(int argc, char **argv) {
         }
         if (IsKeyPressed(KEY_G)) snap = !snap;
         if (IsKeyPressed(KEY_E)) {
-            bool ok = ExportFletcher(out, path);
+            bool ok = ExportFletcher(out);
             snprintf(status, sizeof status, ok ? "exported to %s" : "could not write %s", out);
             status_until = GetTime() + 3;
             if (ok) printf("dfa: %s\n", status);
