@@ -642,9 +642,9 @@ static void WriteTypstString(FILE *f, const char *s) {
     fputc('"', f);
 }
 
-// Label content: $...$ passes through as math; plain text is written as
-// markup when it can't be mistaken for markup, otherwise as a string.
-static void WriteContent(FILE *f, const char *s) {
+// State label content: $...$ passes through as math; plain text is written
+// as markup when it can't be mistaken for markup, otherwise as a string.
+static void WriteText(FILE *f, const char *s) {
     size_t len = strlen(s);
     if (len >= 2 && s[0] == '$' && s[len - 1] == '$') { fputs(s, f); return; }
     bool plain = true;
@@ -657,6 +657,25 @@ static void WriteContent(FILE *f, const char *s) {
         WriteTypstString(f, s);
         fputc(']', f);
     }
+}
+
+// Edge label content, typeset as math. $...$ passes through as Typst math
+// source; anything else is taken literally: punctuation is escaped (so `->`
+// or `_` stay as typed), and letters are spaced apart from neighbouring
+// letters and digits so runs like `ab` or `q0` aren't read as variable names.
+static void WriteMath(FILE *f, const char *s) {
+    size_t len = strlen(s);
+    if (len >= 2 && s[0] == '$' && s[len - 1] == '$') { fputs(s, f); return; }
+    if (len == 0) { fputs("[]", f); return; }
+    fputc('$', f);
+    unsigned char prev = 0;
+    for (const unsigned char *c = (const unsigned char *)s; *c; c++) {
+        if (isalnum(*c) && isalnum(prev) && (isalpha(*c) || isalpha(prev))) fputc(' ', f);
+        if (ispunct(*c)) fputc('\\', f);
+        fputc(*c, f);
+        prev = *c;
+    }
+    fputc('$', f);
 }
 
 // State names become Typst labels: <q0> when valid, else label("...").
@@ -694,7 +713,7 @@ static bool ExportFletcher(const char *out, const char *source) {
     for (int s = 0; s < n_states; s++) {
         Vector2 g = Vector2Scale(Vector2Subtract(states[s].pos, origin), 1 / GRID);
         fprintf(f, "    state(at(%s, %s), ", Num(g.x), Num(g.y));
-        WriteContent(f, states[s].label);
+        WriteText(f, states[s].label);
         fputs(", name: ", f);
         WriteName(f, states[s].name);
         // Outer stroke first: fletcher fills inside the first extrude offset.
@@ -723,7 +742,7 @@ static bool ExportFletcher(const char *out, const char *source) {
         if (*edges[e].label) {
             static const char *side_names[] = { "auto", "left", "right", "center" };
             fputs(", ", f);
-            WriteContent(f, edges[e].label);
+            WriteMath(f, edges[e].label);
             if (edges[e].label_pos != 0.5f) fprintf(f, ", label-pos: %s", Num(edges[e].label_pos));
             if (edges[e].label_side != SIDE_AUTO) fprintf(f, ", label-side: %s", side_names[edges[e].label_side]);
             if (edges[e].label_sep >= 0 && edges[e].label_side != SIDE_CENTER)
