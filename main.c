@@ -13,9 +13,10 @@
 //   several edges between the same pair   merged, labels joined with ", "
 //
 // Controls:
-//   left-drag   move a state
-//   G           toggle grid snapping
-//   E           export fletcher code
+//   left-drag     move a state or an edge label
+//   right-click   reset an edge label to fletcher's default placement
+//   G             toggle grid snapping
+//   E             export fletcher code
 
 #define _POSIX_C_SOURCE 200809L  // popen, getline, strdup
 
@@ -39,6 +40,16 @@
 #define INIT_LEN    40.0f
 #define FLETCHER_VERSION "0.5.8"
 
+// Edge labels, measured as fletcher does. The export maps one grid square to
+// 1cm, and Typst's default text size is 11pt.
+#define PT_PX          (GRID / 28.3465f)
+#define EM_PX          (11 * PT_PX)
+#define LABEL_SEP_EM   0.4f    // fletcher's default label-sep
+#define LABEL_INSET_EM 0.2f    // inset of fletcher's label box
+#define LABEL_POS_STEP 0.05f   // dragged label-pos snaps to this
+#define LABEL_SEP_STEP 0.1f    // dragged label-sep snaps to this (em)
+#define CENTER_BAND    6.0f    // a label dragged this close (px) sits on the edge
+
 #define MAX_STATES  128
 #define MAX_EDGES   512
 #define PX_PER_INCH 150.0f   // Graphviz packs nodes tightly; spread them out a bit
@@ -57,10 +68,22 @@ typedef struct {
     Vector2 init_dir;  // direction the initial arrow comes from
 } State;
 
+// Which side of an edge its label sits on, relative to the direction of
+// travel, as in fletcher's `label-side`.
+typedef enum { SIDE_AUTO, SIDE_LEFT, SIDE_RIGHT, SIDE_CENTER } LabelSide;
+
 typedef struct {
     int from, to;
     char *label;
+    float label_pos;       // fraction along the drawn edge
+    LabelSide label_side;
+    float label_sep;       // em; negative for fletcher's default
 } Edge;
+
+typedef struct {
+    Vector2 pts[ARC_SEGS + 1];
+    int n;
+} Path;
 
 static State states[MAX_STATES];
 static int n_states;
@@ -146,7 +169,7 @@ static void AddEdge(int from, int to, const char *label) {
         return;
     }
     if (n_edges == MAX_EDGES) return;
-    edges[n_edges++] = (Edge){ from, to, strdup(label) };
+    edges[n_edges++] = (Edge){ from, to, strdup(label), 0.5f, SIDE_AUTO, -1 };
 }
 
 // Load the automaton and lay it out to fit a window of size *w x *h.
@@ -259,9 +282,15 @@ static void DrawArrowHead(Vector2 tip, Vector2 dir, Color col) {
     FillTriangle(tip, Vector2Add(base, n), Vector2Subtract(base, n), col);
 }
 
-static void DrawLabel(const char *text, Vector2 center) {
+// Labels written as Typst math ($...$) are shown without the dollars.
+static const char *DisplayText(const char *text) {
     size_t len = strlen(text);
-    if (len >= 2 && text[0] == '$' && text[len - 1] == '$') text = TextSubtext(text, 1, len - 2);
+    if (len >= 2 && text[0] == '$' && text[len - 1] == '$') return TextSubtext(text, 1, len - 2);
+    return text;
+}
+
+static void DrawLabel(const char *text, Vector2 center) {
+    text = DisplayText(text);
     Vector2 size = MeasureTextEx(GetFontDefault(), text, FONT_SIZE, 2);
     Vector2 at = { center.x - size.x / 2, center.y - size.y / 2 };
     DrawTextEx(GetFontDefault(), text, at, FONT_SIZE, 2, INK);
@@ -281,55 +310,6 @@ static bool HasReverse(int e) {
     for (int i = 0; i < n_edges; i++)
         if (edges[i].from == edges[e].to && edges[i].to == edges[e].from) return true;
     return false;
-}
-
-// Edge between distinct states: straight, or a circular arc (as in fletcher's
-// `bend:`) when there is an edge going the other way.
-static void DrawTransition(int e) {
-    Vector2 a = states[edges[e].from].pos, b = states[edges[e].to].pos;
-    float ra = NODE_R, rb = NODE_R;
-    float d = Vector2Distance(a, b);
-    if (d < ra + rb + 1) return;
-    Vector2 u = Vector2Scale(Vector2Subtract(b, a), 1.0f / d);
-    Vector2 n = Perp(u);
-
-    if (!HasReverse(e)) {
-        Vector2 pts[2] = { Vector2Add(a, Vector2Scale(u, ra)), Vector2Subtract(b, Vector2Scale(u, rb)) };
-        DrawPolyArrow(pts, 2);
-        // Like fletcher's `label-side: auto`: left of travel when heading
-        // rightwards, otherwise right, so the label ends up roughly above.
-        float page_angle = atan2f(-u.y, u.x);
-        Vector2 side = fabsf(page_angle) < PI / 2 ? Vector2Negate(n) : n;
-        Vector2 mid = Vector2Lerp(a, b, 0.5f);
-        DrawLabel(edges[e].label, Vector2Add(mid, Vector2Scale(side, 14)));
-        return;
-    }
-
-    // Arc whose tangent at each end makes angle theta with the chord.
-    float theta = BEND_DEG * DEG2RAD;
-    float r = (d / 2) / sinf(theta);
-    Vector2 mid = Vector2Lerp(a, b, 0.5f);
-    Vector2 bulge = Vector2Scale(n, -1);  // bulge to the left of travel; reverse edge bulges the other way
-    Vector2 c = Vector2Subtract(mid, Vector2Scale(bulge, r * cosf(theta)));
-    float a0 = atan2f(a.y - c.y, a.x - c.x);
-    float a1 = atan2f(b.y - c.y, b.x - c.x);
-    float sweep = a1 - a0;
-    while (sweep > PI) sweep -= 2 * PI;
-    while (sweep < -PI) sweep += 2 * PI;
-
-    // Sample the arc, keeping only the part outside both node circles.
-    Vector2 pts[ARC_SEGS + 1];
-    int n_pts = 0;
-    for (int i = 0; i <= ARC_SEGS; i++) {
-        float t = a0 + sweep * i / ARC_SEGS;
-        Vector2 p = { c.x + r * cosf(t), c.y + r * sinf(t) };
-        if (Vector2Distance(p, a) >= ra && Vector2Distance(p, b) >= rb) pts[n_pts++] = p;
-    }
-    if (n_pts < 2) return;
-    DrawPolyArrow(pts, n_pts);
-
-    Vector2 apex = Vector2Add(mid, Vector2Scale(bulge, r * (1 - cosf(theta))));
-    DrawLabel(edges[e].label, Vector2Add(apex, Vector2Scale(bulge, 14)));
 }
 
 static int CompareFloat(const void *a, const void *b) {
@@ -365,26 +345,201 @@ static Vector2 LoopDirection(int s) {
     return (Vector2){ cosf(best_mid), sinf(best_mid) };
 }
 
-static void DrawSelfLoop(int e) {
-    int s = edges[e].from;
-    Vector2 p = states[s].pos;
-    float R = NODE_R;
-    float lr = NODE_R * 0.55f;           // loop circle radius
-    float D = R + lr * 0.45f;            // distance between node and loop centres
-    Vector2 dir = LoopDirection(s);
-    Vector2 c = Vector2Add(p, Vector2Scale(dir, D));
+// The edge as drawn, from the source's boundary to the arrow tip: a straight
+// line, a circular arc (as in fletcher's `bend:`) when there is an edge going
+// the other way, or a self-loop. Empty if the states overlap.
+static Path EdgePath(int e) {
+    Path path = { .n = 0 };
+    Vector2 a = states[edges[e].from].pos, b = states[edges[e].to].pos;
 
-    // Angle (around the loop centre, measured from the node-facing direction)
-    // where the loop circle crosses the node circle.
-    float alpha = acosf((D * D + lr * lr - R * R) / (2 * D * lr));
-    float back = atan2f(-dir.y, -dir.x);
-    Vector2 pts[ARC_SEGS + 1];
-    for (int i = 0; i <= ARC_SEGS; i++) {
-        float t = back + alpha + (2 * PI - 2 * alpha) * i / ARC_SEGS;
-        pts[i] = (Vector2){ c.x + lr * cosf(t), c.y + lr * sinf(t) };
+    if (edges[e].from == edges[e].to) {
+        float lr = NODE_R * 0.55f;           // loop circle radius
+        float D = NODE_R + lr * 0.45f;       // distance between node and loop centres
+        Vector2 dir = LoopDirection(edges[e].from);
+        Vector2 c = Vector2Add(a, Vector2Scale(dir, D));
+
+        // Angle (around the loop centre, measured from the node-facing direction)
+        // where the loop circle crosses the node circle.
+        float alpha = acosf((D * D + lr * lr - NODE_R * NODE_R) / (2 * D * lr));
+        float back = atan2f(-dir.y, -dir.x);
+        for (int i = 0; i <= ARC_SEGS; i++) {
+            float t = back + alpha + (2 * PI - 2 * alpha) * i / ARC_SEGS;
+            path.pts[path.n++] = (Vector2){ c.x + lr * cosf(t), c.y + lr * sinf(t) };
+        }
+        return path;
     }
-    DrawPolyArrow(pts, ARC_SEGS + 1);
-    DrawLabel(edges[e].label, Vector2Add(c, Vector2Scale(dir, lr + 13)));
+
+    float d = Vector2Distance(a, b);
+    if (d < 2 * NODE_R + 1) return path;
+    Vector2 u = Vector2Scale(Vector2Subtract(b, a), 1.0f / d);
+
+    if (!HasReverse(e)) {
+        path.pts[0] = Vector2Add(a, Vector2Scale(u, NODE_R));
+        path.pts[1] = Vector2Subtract(b, Vector2Scale(u, NODE_R));
+        path.n = 2;
+        return path;
+    }
+
+    // Arc whose tangent at each end makes angle theta with the chord, bulging
+    // to the left of travel (so the reverse edge bulges the other way).
+    float theta = BEND_DEG * DEG2RAD;
+    float r = (d / 2) / sinf(theta);
+    Vector2 left = { u.y, -u.x };
+    Vector2 c = Vector2Subtract(Vector2Lerp(a, b, 0.5f), Vector2Scale(left, r * cosf(theta)));
+    float a0 = atan2f(a.y - c.y, a.x - c.x);
+    float a1 = atan2f(b.y - c.y, b.x - c.x);
+    float sweep = a1 - a0;
+    while (sweep > PI) sweep -= 2 * PI;
+    while (sweep < -PI) sweep += 2 * PI;
+
+    // Sample the arc, keeping only the part outside both node circles.
+    for (int i = 0; i <= ARC_SEGS; i++) {
+        float t = a0 + sweep * i / ARC_SEGS;
+        Vector2 p = { c.x + r * cosf(t), c.y + r * sinf(t) };
+        if (Vector2Distance(p, a) >= NODE_R && Vector2Distance(p, b) >= NODE_R) path.pts[path.n++] = p;
+    }
+    if (path.n < 2) path.n = 0;
+    return path;
+}
+
+static float PathLength(const Path *p) {
+    float len = 0;
+    for (int i = 0; i + 1 < p->n; i++) len += Vector2Distance(p->pts[i], p->pts[i + 1]);
+    return len;
+}
+
+// Point at fraction t of the path's length, and the unit tangent there.
+static Vector2 PathAt(const Path *p, float t, Vector2 *tangent) {
+    float target = t * PathLength(p);
+    for (int i = 0; i + 1 < p->n; i++) {
+        float seg = Vector2Distance(p->pts[i], p->pts[i + 1]);
+        if (target <= seg || i + 2 == p->n) {
+            *tangent = Vector2Normalize(Vector2Subtract(p->pts[i + 1], p->pts[i]));
+            return Vector2Lerp(p->pts[i], p->pts[i + 1], seg > 0 ? fminf(target / seg, 1) : 0);
+        }
+        target -= seg;
+    }
+    *tangent = (Vector2){ 1, 0 };
+    return p->pts[0];
+}
+
+// Fraction along the path of the point nearest q. *left gets q's distance
+// from the path, positive to the left of travel.
+static float PathNearest(const Path *p, Vector2 q, float *left) {
+    float total = PathLength(p), walked = 0, best = INFINITY, best_t = 0;
+    *left = 0;
+    for (int i = 0; i + 1 < p->n; i++) {
+        Vector2 a = p->pts[i], ab = Vector2Subtract(p->pts[i + 1], a);
+        float seg = Vector2Length(ab);
+        float k = seg > 0 ? Clamp(Vector2DotProduct(Vector2Subtract(q, a), ab) / (seg * seg), 0, 1) : 0;
+        Vector2 near = Vector2Add(a, Vector2Scale(ab, k));
+        float dist = Vector2Distance(q, near);
+        if (dist < best) {
+            Vector2 lhs = { ab.y, -ab.x };
+            best = dist;
+            best_t = total > 0 ? (walked + k * seg) / total : 0;
+            *left = Vector2DotProduct(Vector2Subtract(q, near), lhs) < 0 ? -dist : dist;
+        }
+        walked += seg;
+    }
+    return best_t;
+}
+
+// fletcher's `label-side: auto`: outside the curve for bent edges and loops
+// (both bend left); for straight edges, left when heading rightwards and
+// otherwise right, so the label ends up roughly above.
+static LabelSide AutoSide(int e) {
+    if (edges[e].from == edges[e].to || HasReverse(e)) return SIDE_LEFT;
+    Vector2 d = Vector2Subtract(states[edges[e].to].pos, states[edges[e].from].pos);
+    return fabsf(atan2f(-d.y, d.x)) < PI / 2 ? SIDE_LEFT : SIDE_RIGHT;
+}
+
+static LabelSide ResolvedSide(int e) {
+    return edges[e].label_side == SIDE_AUTO ? AutoSide(e) : edges[e].label_side;
+}
+
+// Unit normal pointing from the edge towards a label on the given side.
+static Vector2 SideNormal(Vector2 tangent, LabelSide side) {
+    Vector2 left = { tangent.y, -tangent.x };
+    return side == SIDE_RIGHT ? Vector2Negate(left) : left;
+}
+
+// Size of fletcher's label box: the text plus its inset. Typst's text box
+// spans cap height to baseline, roughly 0.7em.
+static Vector2 LabelSize(const char *text) {
+    float w = MeasureTextEx(GetFontDefault(), DisplayText(text), FONT_SIZE, 2).x;
+    return (Vector2){ w + 2 * LABEL_INSET_EM * EM_PX, (0.7f + 2 * LABEL_INSET_EM) * EM_PX };
+}
+
+// Offset from a label box's centre to its anchor: the compass point facing
+// `toward`, rounded to 45 degrees as in fletcher's angle-to-anchor.
+static Vector2 AnchorOffset(Vector2 toward, Vector2 size) {
+    float a = roundf(atan2f(toward.y, toward.x) / (PI / 4)) * (PI / 4);
+    return (Vector2){ roundf(cosf(a)) * size.x / 2, roundf(sinf(a)) * size.y / 2 };
+}
+
+static Rectangle LabelRect(int e, const Path *p) {
+    Vector2 size = LabelSize(edges[e].label), tangent;
+    Vector2 at = PathAt(p, edges[e].label_pos, &tangent);
+    LabelSide side = ResolvedSide(e);
+    Vector2 c = at;
+    if (side != SIDE_CENTER) {
+        Vector2 out = SideNormal(tangent, side);
+        float sep = (edges[e].label_sep < 0 ? LABEL_SEP_EM : edges[e].label_sep) * EM_PX;
+        Vector2 anchor = Vector2Add(at, Vector2Scale(out, sep));
+        c = Vector2Subtract(anchor, AnchorOffset(Vector2Negate(out), size));
+    }
+    return (Rectangle){ c.x - size.x / 2, c.y - size.y / 2, size.x, size.y };
+}
+
+static Vector2 RectCenter(Rectangle r) {
+    return (Vector2){ r.x + r.width / 2, r.y + r.height / 2 };
+}
+
+// Place edge e's label as near as fletcher allows to a box centred at c.
+static void DragLabel(int e, Vector2 c) {
+    Path p = EdgePath(e);
+    if (p.n < 2) return;
+    float left;
+    float t = PathNearest(&p, c, &left);
+    t = Clamp(roundf(t / LABEL_POS_STEP) * LABEL_POS_STEP, 0, 1);
+    edges[e].label_pos = t;
+
+    if (fabsf(left) < CENTER_BAND) {
+        edges[e].label_side = SIDE_CENTER;
+        return;
+    }
+    LabelSide side = left > 0 ? SIDE_LEFT : SIDE_RIGHT;
+    Vector2 tangent;
+    Vector2 at = PathAt(&p, t, &tangent);
+    Vector2 out = SideNormal(tangent, side);
+    Vector2 anchor = Vector2Add(c, AnchorOffset(Vector2Negate(out), LabelSize(edges[e].label)));
+    float sep = fmaxf(0, Vector2DotProduct(Vector2Subtract(anchor, at), out) / EM_PX);
+    sep = roundf(sep / LABEL_SEP_STEP) * LABEL_SEP_STEP;
+
+    edges[e].label_side = side == AutoSide(e) ? SIDE_AUTO : side;
+    edges[e].label_sep = fabsf(sep - LABEL_SEP_EM) < LABEL_SEP_STEP / 2 ? -1 : sep;
+}
+
+// fill: highlight behind the label, or BLANK for none.
+static void DrawEdge(int e, Color fill) {
+    Path p = EdgePath(e);
+    if (p.n < 2) return;
+    DrawPolyArrow(p.pts, p.n);
+    if (!*edges[e].label) return;
+    Rectangle r = LabelRect(e, &p);
+    if (fill.a > 0) DrawRectangleRounded(r, 0.3f, 4, fill);
+    else if (ResolvedSide(e) == SIDE_CENTER) DrawRectangleRec(r, BG);  // fletcher fills centred labels
+    DrawLabel(edges[e].label, RectCenter(r));
+}
+
+static int LabelAt(Vector2 m) {
+    for (int e = n_edges - 1; e >= 0; e--) {
+        if (!*edges[e].label) continue;
+        Path p = EdgePath(e);
+        if (p.n >= 2 && CheckCollisionPointRec(m, LabelRect(e, &p))) return e;
+    }
+    return -1;
 }
 
 static void DrawState(int s, Color fill) {
@@ -517,8 +672,13 @@ static bool ExportFletcher(const char *out, const char *source) {
         WriteName(f, states[edges[e].to].name);
         fputs(", \"-|>\"", f);
         if (*edges[e].label) {
+            static const char *side_names[] = { "auto", "left", "right", "center" };
             fputs(", ", f);
             WriteContent(f, edges[e].label);
+            if (edges[e].label_pos != 0.5f) fprintf(f, ", label-pos: %s", Num(edges[e].label_pos));
+            if (edges[e].label_side != SIDE_AUTO) fprintf(f, ", label-side: %s", side_names[edges[e].label_side]);
+            if (edges[e].label_sep >= 0 && edges[e].label_side != SIDE_CENTER)
+                fprintf(f, ", label-sep: %sem", Num(edges[e].label_sep));
         }
         if (edges[e].from == edges[e].to) {
             Vector2 dir = LoopDirection(edges[e].from);
@@ -568,7 +728,7 @@ int main(int argc, char **argv) {
     InitWindow(w, h, TextFormat("dfa - %s", GetFileName(path)));
     SetTargetFPS(60);
 
-    int dragging = -1;
+    int dragging = -1, dragging_label = -1;
     Vector2 grab = { 0 };
     bool snap = false;
     char status[512] = "";
@@ -577,15 +737,28 @@ int main(int argc, char **argv) {
     while (!WindowShouldClose()) {
         Vector2 m = GetMousePosition();
         int hover = StateAt(m);
+        int hover_label = hover < 0 ? LabelAt(m) : -1;
 
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && hover >= 0) {
-            dragging = hover;
-            grab = Vector2Subtract(states[hover].pos, m);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            if (hover >= 0) {
+                dragging = hover;
+                grab = Vector2Subtract(states[hover].pos, m);
+            } else if (hover_label >= 0) {
+                Path p = EdgePath(hover_label);
+                dragging_label = hover_label;
+                grab = Vector2Subtract(RectCenter(LabelRect(hover_label, &p)), m);
+            }
         }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) dragging = -1;
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) dragging = dragging_label = -1;
         if (dragging >= 0) {
             Vector2 p = Vector2Add(m, grab);
             states[dragging].pos = snap ? Snap(p) : p;
+        }
+        if (dragging_label >= 0) DragLabel(dragging_label, Vector2Add(m, grab));
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && hover_label >= 0) {
+            edges[hover_label].label_pos = 0.5f;
+            edges[hover_label].label_side = SIDE_AUTO;
+            edges[hover_label].label_sep = -1;
         }
         if (IsKeyPressed(KEY_G)) snap = !snap;
         if (IsKeyPressed(KEY_E)) {
@@ -595,7 +768,8 @@ int main(int argc, char **argv) {
             if (ok) printf("dfa: %s\n", status);
         }
 
-        SetMouseCursor(dragging >= 0 || hover >= 0 ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
+        bool pointing = dragging >= 0 || dragging_label >= 0 || hover >= 0 || hover_label >= 0;
+        SetMouseCursor(pointing ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
 
         BeginDrawing();
         ClearBackground(BG);
@@ -603,16 +777,14 @@ int main(int argc, char **argv) {
             for (float x = 0; x < GetScreenWidth(); x += GRID) DrawLineV((Vector2){ x, 0 }, (Vector2){ x, GetScreenHeight() }, GRIDC);
             for (float y = 0; y < GetScreenHeight(); y += GRID) DrawLineV((Vector2){ 0, y }, (Vector2){ GetScreenWidth(), y }, GRIDC);
         }
-        for (int e = 0; e < n_edges; e++) {
-            if (edges[e].from == edges[e].to) DrawSelfLoop(e);
-            else DrawTransition(e);
-        }
+        for (int e = 0; e < n_edges; e++)
+            DrawEdge(e, e == dragging_label ? ACTIVE : e == hover_label ? HOVER : BLANK);
         for (int s = 0; s < n_states; s++)
             if (states[s].initial) DrawInitialArrow(s);
         for (int s = 0; s < n_states; s++)
             DrawState(s, s == dragging ? ACTIVE : s == hover ? HOVER : BG);
 
-        const char *help = TextFormat("drag states   [G] snap: %s   [E] export fletcher", snap ? "on" : "off");
+        const char *help = TextFormat("drag states and labels   [G] snap: %s   [E] export fletcher", snap ? "on" : "off");
         DrawText(GetTime() < status_until ? status : help, 12, GetScreenHeight() - 26, 16, GRAY);
         EndDrawing();
 
