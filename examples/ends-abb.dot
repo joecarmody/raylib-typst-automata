@@ -1,0 +1,17 @@
+// DFA over {a,b} accepting strings that end in "abb".
+digraph ends_abb {
+    rankdir=LR;
+    node [shape=circle];
+    start [shape=point];
+    q3 [shape=doublecircle];
+
+    start -> q0;
+    q0 -> q1 [label="a"];
+    q0 -> q0 [label="b"];
+    q1 -> q1 [label="a"];
+    q1 -> q2 [label="b"];
+    q2 -> q1 [label="a"];
+    q2 -> q3 [label="b"];
+    q3 -> q1 [label="a"];
+    q3 -> q0 [label="b"];
+}
