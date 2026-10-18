@@ -1,6 +1,9 @@
 // Drag-to-arrange finite automaton viewer.
 //
-// Usage: dfa [--screenshot out.png] automaton.dot
+// Usage: dfa [-o out.typ] [--export] [--screenshot out.png] automaton.dot
+//
+//   -o out.typ   where to write fletcher code (default: automaton.typ)
+//   --export     write the fletcher code for Graphviz's layout and exit
 //
 // The DOT file is laid out by Graphviz (`dot -Tplain`) for the starting
 // positions. Conventions:
@@ -12,10 +15,11 @@
 // Controls:
 //   left-drag   move a state
 //   G           toggle grid snapping
-//   P           print state positions (in grid units) to stdout
+//   E           export fletcher code
 
 #define _POSIX_C_SOURCE 200809L  // popen, getline, strdup
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +28,7 @@
 #include "raymath.h"
 
 #define NODE_R      28.0f
-#define ACCEPT_GAP  5.0f
+#define ACCEPT_GAP  4.0f     // inner ring of accepting states
 #define GRID        60.0f
 #define BEND_DEG    25.0f
 #define ARROW_LEN   12.0f
@@ -33,6 +37,7 @@
 #define FONT_SIZE   20
 #define ARC_SEGS    48
 #define INIT_LEN    40.0f
+#define FLETCHER_VERSION "0.5.8"
 
 #define MAX_STATES  128
 #define MAX_EDGES   512
@@ -238,10 +243,6 @@ static bool LoadDot(const char *path, int *w, int *h) {
 // ---------------------------------------------------------------------------
 // Drawing
 
-static float OuterRadius(int s) {
-    return states[s].accepting ? NODE_R + ACCEPT_GAP : NODE_R;
-}
-
 static Vector2 Perp(Vector2 v) { return (Vector2){ -v.y, v.x }; }
 
 // raylib wants counter-clockwise vertices; accept either winding.
@@ -259,6 +260,8 @@ static void DrawArrowHead(Vector2 tip, Vector2 dir, Color col) {
 }
 
 static void DrawLabel(const char *text, Vector2 center) {
+    size_t len = strlen(text);
+    if (len >= 2 && text[0] == '$' && text[len - 1] == '$') text = TextSubtext(text, 1, len - 2);
     Vector2 size = MeasureTextEx(GetFontDefault(), text, FONT_SIZE, 2);
     Vector2 at = { center.x - size.x / 2, center.y - size.y / 2 };
     DrawTextEx(GetFontDefault(), text, at, FONT_SIZE, 2, INK);
@@ -284,7 +287,7 @@ static bool HasReverse(int e) {
 // `bend:`) when there is an edge going the other way.
 static void DrawTransition(int e) {
     Vector2 a = states[edges[e].from].pos, b = states[edges[e].to].pos;
-    float ra = OuterRadius(edges[e].from), rb = OuterRadius(edges[e].to);
+    float ra = NODE_R, rb = NODE_R;
     float d = Vector2Distance(a, b);
     if (d < ra + rb + 1) return;
     Vector2 u = Vector2Scale(Vector2Subtract(b, a), 1.0f / d);
@@ -293,8 +296,12 @@ static void DrawTransition(int e) {
     if (!HasReverse(e)) {
         Vector2 pts[2] = { Vector2Add(a, Vector2Scale(u, ra)), Vector2Subtract(b, Vector2Scale(u, rb)) };
         DrawPolyArrow(pts, 2);
+        // Like fletcher's `label-side: auto`: left of travel when heading
+        // rightwards, otherwise right, so the label ends up roughly above.
+        float page_angle = atan2f(-u.y, u.x);
+        Vector2 side = fabsf(page_angle) < PI / 2 ? Vector2Negate(n) : n;
         Vector2 mid = Vector2Lerp(a, b, 0.5f);
-        DrawLabel(edges[e].label, Vector2Add(mid, Vector2Scale(n, -14)));
+        DrawLabel(edges[e].label, Vector2Add(mid, Vector2Scale(side, 14)));
         return;
     }
 
@@ -302,7 +309,7 @@ static void DrawTransition(int e) {
     float theta = BEND_DEG * DEG2RAD;
     float r = (d / 2) / sinf(theta);
     Vector2 mid = Vector2Lerp(a, b, 0.5f);
-    Vector2 bulge = Vector2Scale(n, -1);  // bulge to the right of travel; reverse edge bulges the other way
+    Vector2 bulge = Vector2Scale(n, -1);  // bulge to the left of travel; reverse edge bulges the other way
     Vector2 c = Vector2Subtract(mid, Vector2Scale(bulge, r * cosf(theta)));
     float a0 = atan2f(a.y - c.y, a.x - c.x);
     float a1 = atan2f(b.y - c.y, b.x - c.x);
@@ -361,7 +368,7 @@ static Vector2 LoopDirection(int s) {
 static void DrawSelfLoop(int e) {
     int s = edges[e].from;
     Vector2 p = states[s].pos;
-    float R = OuterRadius(s);
+    float R = NODE_R;
     float lr = NODE_R * 0.55f;           // loop circle radius
     float D = R + lr * 0.45f;            // distance between node and loop centres
     Vector2 dir = LoopDirection(s);
@@ -382,23 +389,23 @@ static void DrawSelfLoop(int e) {
 
 static void DrawState(int s, Color fill) {
     Vector2 p = states[s].pos;
-    DrawCircleV(p, OuterRadius(s), fill);
+    DrawCircleV(p, NODE_R, fill);
     DrawRing(p, NODE_R - STROKE / 2, NODE_R + STROKE / 2, 0, 360, 64, INK);
     if (states[s].accepting)
-        DrawRing(p, NODE_R + ACCEPT_GAP - STROKE / 2, NODE_R + ACCEPT_GAP + STROKE / 2, 0, 360, 64, INK);
+        DrawRing(p, NODE_R - ACCEPT_GAP - STROKE / 2, NODE_R - ACCEPT_GAP + STROKE / 2, 0, 360, 64, INK);
     DrawLabel(states[s].label, p);
 }
 
 static void DrawInitialArrow(int s) {
     Vector2 p = states[s].pos, dir = states[s].init_dir;
-    Vector2 tip = Vector2Add(p, Vector2Scale(dir, OuterRadius(s)));
+    Vector2 tip = Vector2Add(p, Vector2Scale(dir, NODE_R));
     Vector2 pts[2] = { Vector2Add(tip, Vector2Scale(dir, INIT_LEN)), tip };
     DrawPolyArrow(pts, 2);
 }
 
 static int StateAt(Vector2 m) {
     for (int s = n_states - 1; s >= 0; s--)
-        if (Vector2Distance(m, states[s].pos) <= OuterRadius(s)) return s;
+        if (Vector2Distance(m, states[s].pos) <= NODE_R) return s;
     return -1;
 }
 
@@ -407,19 +414,155 @@ static Vector2 Snap(Vector2 v) {
     return (Vector2){ roundf(v.x / g) * g, roundf(v.y / g) * g };
 }
 
+// ---------------------------------------------------------------------------
+// fletcher export
+
+// Grid coordinate with trailing zeros dropped: 1.5, 0.25, 2. Returns one of a
+// few rotating static buffers so several can appear in one printf.
+static const char *Num(float v) {
+    static char buf[8][32];
+    static int next;
+    char *b = buf[next++ % 8];
+    snprintf(b, sizeof buf[0], "%.3f", v);
+    char *end = b + strlen(b) - 1;
+    while (*end == '0') *end-- = '\0';
+    if (*end == '.') *end = '\0';
+    if (strcmp(b, "-0") == 0) strcpy(b, "0");
+    return b;
+}
+
+static void WriteTypstString(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') fputc('\\', f);
+        fputc(*s, f);
+    }
+    fputc('"', f);
+}
+
+// Label content: $...$ passes through as math; plain text is written as
+// markup when it can't be mistaken for markup, otherwise as a string.
+static void WriteContent(FILE *f, const char *s) {
+    size_t len = strlen(s);
+    if (len >= 2 && s[0] == '$' && s[len - 1] == '$') { fputs(s, f); return; }
+    bool plain = true;
+    for (const char *c = s; *c; c++)
+        if (!isalnum((unsigned char)*c) && !strchr(" ,:;()!?|&%", *c)) plain = false;
+    if (plain) {
+        fprintf(f, "[%s]", s);
+    } else {
+        fputs("[#", f);
+        WriteTypstString(f, s);
+        fputc(']', f);
+    }
+}
+
+// State names become Typst labels: <q0> when valid, else label("...").
+static void WriteName(FILE *f, const char *s) {
+    bool simple = *s != '\0';
+    for (const char *c = s; *c; c++)
+        if (!isalnum((unsigned char)*c) && !strchr("_-:.", *c)) simple = false;
+    if (simple) {
+        fprintf(f, "<%s>", s);
+    } else {
+        fputs("label(", f);
+        WriteTypstString(f, s);
+        fputc(')', f);
+    }
+}
+
+static bool ExportFletcher(const char *out, const char *source) {
+    FILE *f = fopen(out, "w");
+    if (!f) { perror(out); return false; }
+
+    // Grid coordinates relative to the top-left-most state, y down.
+    Vector2 origin = states[0].pos;
+    for (int s = 1; s < n_states; s++) {
+        origin.x = fminf(origin.x, states[s].pos.x);
+        origin.y = fminf(origin.y, states[s].pos.y);
+    }
+
+    fprintf(f, "// Generated by dfa from %s; exporting again overwrites this file.\n", GetFileName(source));
+    fprintf(f, "#import \"@preview/fletcher:%s\" as fletcher: diagram, node, edge\n\n", FLETCHER_VERSION);
+    fprintf(f, "#diagram(\n  node-stroke: 0.8pt,\n  {\n");
+    fprintf(f, "    let u = 1cm  // one editor grid square\n");
+    fprintf(f, "    let at(x, y) = (x * u, -y * u)  // y points down, as in the editor\n");
+    fprintf(f, "    let state = node.with(shape: circle, radius: %s * u)\n\n", Num(NODE_R / GRID));
+
+    for (int s = 0; s < n_states; s++) {
+        Vector2 g = Vector2Scale(Vector2Subtract(states[s].pos, origin), 1 / GRID);
+        fprintf(f, "    state(at(%s, %s), ", Num(g.x), Num(g.y));
+        WriteContent(f, states[s].label);
+        fputs(", name: ", f);
+        WriteName(f, states[s].name);
+        if (states[s].accepting) fputs(", extrude: (-2.5, 0)", f);
+        fputs(")\n", f);
+    }
+    fputc('\n', f);
+
+    for (int s = 0; s < n_states; s++) {
+        if (!states[s].initial) continue;
+        Vector2 d = Vector2Scale(states[s].init_dir, (NODE_R + INIT_LEN) / GRID);
+        fprintf(f, "    edge((rel: at(%s, %s), to: ", Num(d.x), Num(d.y));
+        WriteName(f, states[s].name);
+        fputs("), ", f);
+        WriteName(f, states[s].name);
+        fputs(", \"-|>\")\n", f);
+    }
+
+    for (int e = 0; e < n_edges; e++) {
+        fputs("    edge(", f);
+        WriteName(f, states[edges[e].from].name);
+        fputs(", ", f);
+        WriteName(f, states[edges[e].to].name);
+        fputs(", \"-|>\"", f);
+        if (*edges[e].label) {
+            fputs(", ", f);
+            WriteContent(f, edges[e].label);
+        }
+        if (edges[e].from == edges[e].to) {
+            Vector2 dir = LoopDirection(edges[e].from);
+            fprintf(f, ", bend: 130deg, loop-angle: %.0fdeg", atan2f(-dir.y, dir.x) * RAD2DEG);
+        } else if (HasReverse(e)) {
+            // Positive fletcher bends bulge to the left of travel, like ours.
+            fprintf(f, ", bend: %sdeg", Num(BEND_DEG));
+        }
+        fputs(")\n", f);
+    }
+    fprintf(f, "  },\n)\n");
+
+    if (fclose(f) != 0) { perror(out); return false; }
+    return true;
+}
+
+// automaton.dot -> automaton.typ
+static char *DefaultOutput(const char *path) {
+    char *out = malloc(strlen(path) + 5);
+    strcpy(out, path);
+    char *dot = strrchr(out, '.');
+    if (dot && (strcmp(dot, ".dot") == 0 || strcmp(dot, ".gv") == 0)) *dot = '\0';
+    strcat(out, ".typ");
+    return out;
+}
+
 int main(int argc, char **argv) {
     // --screenshot <file>: render one frame to a PNG and exit.
-    const char *shot = NULL, *path = NULL;
+    const char *shot = NULL, *path = NULL, *out = NULL;
+    bool export_only = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) shot = argv[++i];
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out = argv[++i];
+        else if (strcmp(argv[i], "--export") == 0) export_only = true;
         else path = argv[i];
     }
     if (!path) {
-        fprintf(stderr, "usage: %s [--screenshot out.png] automaton.dot\n", argv[0]);
+        fprintf(stderr, "usage: %s [-o out.typ] [--export] [--screenshot out.png] automaton.dot\n", argv[0]);
         return 2;
     }
+    if (!out) out = DefaultOutput(path);
     int w, h;
     if (!LoadDot(path, &w, &h)) return 1;
+    if (export_only) return ExportFletcher(out, path) ? 0 : 1;
 
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(w, h, TextFormat("dfa - %s", GetFileName(path)));
@@ -428,6 +571,8 @@ int main(int argc, char **argv) {
     int dragging = -1;
     Vector2 grab = { 0 };
     bool snap = false;
+    char status[512] = "";
+    double status_until = 0;
 
     while (!WindowShouldClose()) {
         Vector2 m = GetMousePosition();
@@ -443,11 +588,11 @@ int main(int argc, char **argv) {
             states[dragging].pos = snap ? Snap(p) : p;
         }
         if (IsKeyPressed(KEY_G)) snap = !snap;
-        if (IsKeyPressed(KEY_P)) {
-            for (int s = 0; s < n_states; s++)
-                printf("%s: (%.2f, %.2f)\n", states[s].name, states[s].pos.x / GRID, states[s].pos.y / GRID);
-            printf("\n");
-            fflush(stdout);
+        if (IsKeyPressed(KEY_E)) {
+            bool ok = ExportFletcher(out, path);
+            snprintf(status, sizeof status, ok ? "exported to %s" : "could not write %s", out);
+            status_until = GetTime() + 3;
+            if (ok) printf("dfa: %s\n", status);
         }
 
         SetMouseCursor(dragging >= 0 || hover >= 0 ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
@@ -467,8 +612,8 @@ int main(int argc, char **argv) {
         for (int s = 0; s < n_states; s++)
             DrawState(s, s == dragging ? ACTIVE : s == hover ? HOVER : BG);
 
-        DrawText(TextFormat("drag states   [G] snap: %s   [P] print positions", snap ? "on" : "off"),
-                 12, GetScreenHeight() - 26, 16, GRAY);
+        const char *help = TextFormat("drag states   [G] snap: %s   [E] export fletcher", snap ? "on" : "off");
+        DrawText(GetTime() < status_until ? status : help, 12, GetScreenHeight() - 26, 16, GRAY);
         EndDrawing();
 
         if (shot) { TakeScreenshot(shot); break; }

@@ -1,0 +1,8 @@
+digraph {
+	"0:0" [shape=doublecircle, color=darkviolet]; 
+	"0:0" -> "0:0" [label="a, b"]; 
+	"1:0" [shape=doublecircle]; "1:1" [shape=doublecircle, color=darkviolet]; 
+	"1:0" -> "1:1" [label="a"]; "1:0" -> "1:0" [label="b, aa"]; "1:1" -> "1:0" [label="b"]; 
+	"2:0" [shape=doublecircle]; "2:1" [shape=doublecircle]; "2:2" [shape=doublecircle, color=darkviolet]; 
+	"2:0" -> "2:1" [label="a, ba"]; "2:0" -> "2:2" [label="b"]; "2:0" -> "2:0" [label="aa"]; "2:1" -> "2:2" [label="b"]; "2:1" -> "2:1" [label="ba"]; "2:2" -> "2:0" [label="aa"]; "2:2" -> "2:1" [label="ba"]; "2:2" -> "2:2" [label="b"]; 
+}
